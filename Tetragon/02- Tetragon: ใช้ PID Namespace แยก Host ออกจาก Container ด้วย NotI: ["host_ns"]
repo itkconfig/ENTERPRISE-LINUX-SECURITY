@@ -1,0 +1,351 @@
+# 🔐 Tetragon: ใช้ PID Namespace แยก Host ออกจาก Container ด้วย `NotIn: ["host_ns"]`
+
+## บทนำ
+
+การป้องกันไม่ให้ Web Server หรือ PHP ภายใน Docker Container เรียกใช้ Shell และเครื่องมือที่อาจถูกนำไปใช้โจมตีระบบ เป็นหนึ่งในแนวทางลดความเสี่ยงจาก Webshell และการยึดครอง Container
+
+Tetragon สามารถตรวจจับพฤติกรรมระดับ Kernel ด้วย eBPF และบังคับใช้นโยบายผ่าน `TracingPolicy` ได้ ตัวอย่างด้านล่างใช้เงื่อนไข
+
+```yaml
+matchNamespaces:
+  - namespace: Pid
+    operator: NotIn
+    values:
+      - "host_ns"
+```
+
+แนวคิดสำคัญคือ เลือกจับเฉพาะโปรเซสที่อยู่ใน PID Namespace ซึ่งไม่ใช่ Host PID Namespace เพื่อจำกัดขอบเขตของ Policy ไม่ให้ไปจับโปรเซสทั่วไปบน Host โดยตรง
+
+> **ข้อควรเข้าใจ:** PID Namespace ที่ไม่ใช่ Host ไม่ได้หมายถึง Docker Container เท่านั้น แต่อาจเป็น Container runtime อื่น ๆ, Kubernetes Pod หรือ namespace ที่ผู้ดูแลสร้างขึ้นเองได้ด้วย เงื่อนไขนี้จึงเป็นการแบ่งขอบเขตด้วย Namespace ไม่ใช่การตรวจสอบ Docker โดยตรง
+
+---
+
+## 1. Linux Namespace และ PID Namespace คืออะไร?
+
+Linux Container ไม่ได้มี Kernel เป็นของตัวเองเหมือน Virtual Machine แต่ใช้ Kernel ร่วมกับ Host และอาศัย Linux Namespace เพื่อแยกมุมมองของทรัพยากรระหว่างกลุ่มโปรเซส
+
+**PID Namespace** ใช้แยกมุมมองหมายเลข Process ID (PID) ระหว่างกลุ่มโปรเซส
+
+- **Host PID Namespace:** โปรเซสบน Host เช่น `systemd`, `sshd`, `crond` และ Agent ต่าง ๆ ทำงานอยู่ใน Namespace หลักของ Host
+- **Container PID Namespace:** เมื่อ Container ถูกสร้างด้วย PID Namespace แยก โปรเซสภายในจะมีมุมมอง PID ของตัวเอง โดยโปรเซสเริ่มต้นของ Container มักมองเห็นตัวเองเป็น PID 1
+- **การมองเห็นโปรเซส:** โปรเซสภายใน Namespace ย่อยจะมองเห็นโปรเซสตามขอบเขตที่ Namespace อนุญาต ไม่ได้เห็นรายการโปรเซสทั้งหมดของ Host ตามปกติ
+
+ตัวอย่างภาพรวม:
+
+```text
+Linux Host
+│
+├── Host PID Namespace
+│   ├── systemd
+│   ├── sshd
+│   ├── wazuh-agent
+│   └── docker/container runtime
+│
+├── Container A: PID Namespace
+│   ├── PID 1  apache/httpd
+│   ├── PID 12 php-fpm
+│   └── PID 25 worker
+│
+└── Container B: PID Namespace
+    ├── PID 1  nginx
+    └── PID 8  application
+```
+
+หมายเหตุ: ภาพนี้เป็นตัวอย่างเชิงแนวคิด ไม่ใช่การแสดง PID จริงจากเครื่องหนึ่งเครื่องใด และ Container ที่ใช้ `--pid=host` จะใช้ Host PID Namespace แทนการแยก Namespace ตามปกติ
+
+## 2. `host_ns` คืออะไร?
+
+ใน Tetragon มีชื่ออ้างอิงพิเศษ `host_ns` สำหรับใช้เปรียบเทียบกับ Namespace ของ Host ในเงื่อนไข `matchNamespaces`
+
+เมื่อ Policy ระบุว่า
+
+```yaml
+matchNamespaces:
+  - namespace: Pid
+    operator: NotIn
+    values:
+      - "host_ns"
+```
+
+ให้อ่านว่า:
+
+- `namespace: Pid` — ให้พิจารณา PID Namespace
+- `operator: NotIn` — ค่าที่ตรวจพบต้องไม่อยู่ในรายการที่กำหนด
+- `values: ["host_ns"]` — รายการที่ใช้เป็นค่าอ้างอิงคือ Host PID Namespace
+
+ดังนั้น Selector นี้จะ match โปรเซสที่ PID Namespace ไม่ใช่ Host PID Namespace
+
+ไม่จำเป็นต้องนำเลข inode ของ Namespace มา hardcode ใน YAML เพราะ Policy ใช้ชื่ออ้างอิง `host_ns` ตามกลไกที่ Tetragon รองรับ
+
+### แล้ว Kernel แยก Namespace ได้อย่างไร?
+
+Linux Kernel มีโครงสร้างข้อมูลสำหรับจัดการ Namespace และแต่ละ Namespace มี inode number ที่ใช้ระบุตัว Namespace นั้นได้ เครื่องมืออย่าง `lsns` และลิงก์ใน `/proc` สามารถช่วยตรวจสอบข้อมูล Namespace ได้ เช่น
+
+```bash
+# ดู PID namespace ของ process 1 บน Host
+readlink /proc/1/ns/pid
+
+# ดู PID namespace ของ shell ปัจจุบัน
+readlink /proc/self/ns/pid
+
+# แสดงรายการ namespace ที่ระบบมองเห็น
+lsns -t pid
+```
+
+ตัวอย่างผลลัพธ์อาจมีลักษณะดังนี้:
+
+```text
+pid:[4026531836]
+```
+
+ตัวเลขในวงเล็บคือ inode number ของ Namespace ในระบบนั้น ๆ โดยค่าจริงขึ้นอยู่กับเครื่องและสภาพแวดล้อม
+
+Tetragon ใช้กลไกติดตาม Namespace ที่รองรับโดยตัวระบบ เพื่อให้ Policy อ้างอิง Host Namespace ได้ด้วย `host_ns` ผู้เขียน Policy จึงไม่ควรตีความว่า YAML กำลังสั่งให้ eBPF อ่านฟิลด์ Kernel ภายในตาม expression ที่เขียนขึ้นเอง หรือยึดตัวเลข inode ตัวอย่างไปใช้เป็นค่าคงที่
+
+## 3. อ่าน Policy ตัวอย่าง: ป้องกัน Shell และเครื่องมือเสี่ยงใน Container
+
+Policy ตัวอย่างนี้แบ่งการตรวจจับออกเป็น 2 ส่วนหลัก
+
+### ส่วนที่ 1: ตรวจการเริ่ม Executable ด้วย `security_bprm_check`
+
+Hook `security_bprm_check` เกี่ยวข้องกับขั้นตอนตรวจสอบก่อนเริ่มทำงานของ Executable จึงเหมาะสำหรับตรวจว่าโปรเซสใดกำลังพยายามเรียกโปรแกรมอะไร
+
+ตัวอย่าง Selector แรก:
+
+```yaml
+- call: "security_bprm_check"
+  syscall: false
+  args:
+    - index: 0
+      type: "linux_binprm"
+  selectors:
+    - matchNamespaces:
+        - namespace: Pid
+          operator: NotIn
+          values:
+            - "host_ns"
+      matchBinaries:
+        - operator: "In"
+          values:
+            - "/usr/local/sbin/php-fpm"
+            - "/usr/sbin/php-fpm"
+            - "/usr/local/bin/php"
+            - "/usr/bin/php"
+            - "/usr/sbin/apache2"
+            - "/usr/sbin/httpd"
+      matchArgs:
+        - index: 0
+          operator: "Postfix"
+          values:
+            - "/sh"
+            - "/bash"
+            - "/dash"
+            - "/curl"
+            - "/wget"
+            - "/nc"
+            - "/nmap"
+            - "/python"
+            - "/python3"
+            - "/perl"
+            - "/ruby"
+            - "/cat"
+            - "/id"
+            - "/whoami"
+      matchActions:
+        - action: "Sigkill"
+```
+
+ความหมายของเงื่อนไข:
+
+1. โปรเซสต้องอยู่ใน PID Namespace ที่ไม่ใช่ Host
+2. Binary ผู้เรียกต้องเป็นหนึ่งใน PHP-FPM, PHP CLI, Apache หรือ httpd ที่ระบุไว้
+3. Argument ที่ตรวจสอบต้องตรงกับ suffix ในรายการ เช่น `/sh`, `/curl` หรือ `/python3`
+4. เมื่อ Selector match จะส่ง `SIGKILL` ไปยังโปรเซสที่เกี่ยวข้อง
+
+**ข้อจำกัด:** รายการ path เป็นแบบระบุค่าที่ต้องการจับ ไม่ได้ครอบคลุมทุกตำแหน่งติดตั้ง เช่น `/bin/busybox` หรือ path อื่นที่ไม่ได้ใส่ไว้ และการใช้ `Postfix` ไม่ใช่การตรวจสอบเนื้อหา HTTP Request หรือเนื้อหาของ PHP Script
+
+### ส่วนที่ 1.2: จำกัด Shell ไม่ให้เรียก Network Tools
+
+Selector อีกชุดหนึ่งจำกัดผู้เรียกให้เป็น Shell ที่ระบุไว้ และตรวจการเรียก Network Tools
+
+```yaml
+- matchNamespaces:
+    - namespace: Pid
+      operator: NotIn
+      values:
+        - "host_ns"
+  matchBinaries:
+    - operator: "In"
+      values:
+        - "/usr/bin/sh"
+        - "/bin/sh"
+        - "/usr/bin/dash"
+        - "/bin/dash"
+        - "/usr/bin/bash"
+        - "/bin/bash"
+  matchArgs:
+    - index: 0
+      operator: "Postfix"
+      values:
+        - "/curl"
+        - "/wget"
+        - "/nc"
+        - "/nmap"
+  matchActions:
+    - action: "Sigkill"
+```
+
+ชุดนี้ไม่ได้บล็อก `curl`, `wget`, `nc` หรือ `nmap` จากทุกโปรแกรม แต่เน้นกรณีที่ Shell ใน PID Namespace ที่ไม่ใช่ Host เป็นผู้เรียกเครื่องมือเหล่านั้น
+
+การไม่ใส่ `id` และ `whoami` ในรายการนี้ช่วยลดโอกาสกระทบ Startup Script ที่ใช้งานทั่วไป แต่ต้องทดสอบกับ Image และ Entrypoint ที่ใช้งานจริง
+
+### ส่วนที่ 2: ตรวจ Shell ที่เปิดไฟล์ PHP
+
+Hook `security_file_open` ใช้ตรวจเหตุการณ์เปิดไฟล์ตามเงื่อนไขของ Policy ตัวอย่างนี้เลือกจับ Shell บางชนิดที่เปิดไฟล์ซึ่งชื่อมี suffix เป็น `.php`, `.phtml` หรือ `.phar`
+
+```yaml
+- call: "security_file_open"
+  syscall: false
+  args:
+    - index: 0
+      type: "file"
+  selectors:
+    - matchNamespaces:
+        - namespace: Pid
+          operator: NotIn
+          values:
+            - "host_ns"
+      matchArgs:
+        - index: 0
+          operator: "Postfix"
+          values:
+            - ".php"
+            - ".phtml"
+            - ".phar"
+      matchBinaries:
+        - operator: "In"
+          values:
+            - "/usr/bin/sh"
+            - "/bin/sh"
+            - "/usr/bin/dash"
+            - "/bin/dash"
+      matchActions:
+        - action: "Sigkill"
+```
+
+**ข้อควรระวังสำคัญ:** ตัวอย่างนี้ยังไม่ได้แยกการเปิดอ่านไฟล์ออกจากการเขียนหรือแก้ไขไฟล์ จึงอาจกระทบ Shell Script ที่เปิดอ่านไฟล์ PHP เพื่อการตรวจสอบหรือการทำงานตามปกติ นอกจากนี้ยังระบุเฉพาะ `sh` และ `dash` ไม่รวม `bash`, `python`, `tee`, `cp` หรือโปรแกรมอื่น
+
+---
+
+## 4. `Sigkill` ทำอะไร และมีผลอย่างไร?
+
+เมื่อเงื่อนไข Selector ตรงกับเหตุการณ์และกำหนด Action เป็น
+
+```yaml
+matchActions:
+  - action: "Sigkill"
+```
+
+Tetragon จะส่งสัญญาณ `SIGKILL` ไปยังโปรเซสที่ตรงเงื่อนไข ทำให้โปรเซสนั้นถูกยุติทันที โดยโปรเซสไม่มีโอกาสจัดการสัญญาณเพื่อปิดงานอย่างเรียบร้อย
+
+สิ่งที่ต้องแยกให้ออก:
+
+- `Sigkill` ในตัวอย่างนี้ไม่ได้หมายถึงการ Pause ทั้ง Container
+- มันไม่ได้หยุดทุกโปรเซสใน Container โดยอัตโนมัติ
+- หากโปรเซสที่ถูกฆ่าเป็นโปรเซสหลักของ Container ผลกระทบอาจทำให้ Container หยุดหรือ Restart ตามนโยบายของ Runtime
+- การจับคู่ผิดพลาดอาจทำให้ Application หรือ Startup Script ทำงานไม่สำเร็จ
+
+จึงควรเริ่มทดสอบใน Lab ก่อนนำไปใช้กับระบบ Production
+
+## 5. ติดตั้งและทดสอบ Policy อย่างปลอดภัย
+
+ตัวอย่างคำสั่งสร้างไฟล์ในโฟลเดอร์ Disabled Policies:
+
+```bash
+sudo install -d -m 0700 /etc/tetragon/disabled-policies
+
+sudo tee /etc/tetragon/disabled-policies/31-proc-prevent-shell-in-container.yaml >/dev/null <<'EOF'
+# วาง TracingPolicy YAML ฉบับเต็มไว้ตรงนี้
+EOF
+```
+
+โฟลเดอร์ `disabled-policies` ในตัวอย่างเป็นตำแหน่งเก็บไฟล์ที่ยังไม่ต้องการเปิดใช้งานโดยอัตโนมัติ ทั้งนี้ต้องตรวจสอบให้ตรงกับวิธีจัดการ Policy และ Service ที่ติดตั้งอยู่จริง
+
+ก่อนเปิดใช้งาน ให้ตรวจสอบอย่างน้อย:
+
+1. ตรวจสอบ YAML ว่าโครงสร้างและ indentation ถูกต้อง
+2. ตรวจสอบว่า Kernel hook, argument type, selector และ action รองรับใน Tetragon รุ่นที่ติดตั้ง
+3. ตรวจสอบ path ของ PHP, Web Server, Shell และเครื่องมือใน Container Image จริง
+4. ทดสอบทั้งกรณีที่ควรถูกบล็อกและกรณีใช้งานปกติ
+5. เฝ้าดู Tetragon event และ Application log เพื่อหาการ Match ที่ไม่ตั้งใจ
+6. เตรียมวิธีปิด Policy หรือ Rollback ก่อนทดสอบกับระบบที่มีผู้ใช้งาน
+
+> **หมายเหตุ:** การย้ายไฟล์เข้าโฟลเดอร์ที่ Tetragon เฝ้าดู ไม่ได้แปลว่าจะโหลด Policy ได้ในทุกการติดตั้ง ต้องตรวจสอบกลไกโหลด Policy ของระบบนั้น เช่น service, Helm chart, operator หรือวิธีจัดการ Policy ที่กำหนดไว้
+
+## 6. ข้อจำกัดที่ควรทราบก่อนใช้จริง
+
+Policy นี้เป็นตัวอย่างการควบคุมพฤติกรรมบางรูปแบบ ไม่ใช่ระบบป้องกัน Webshell ที่ครอบคลุมทุกเทคนิค
+
+- ผู้โจมตีอาจใช้ Binary หรือ path ที่ไม่อยู่ในรายการ
+- การเรียกผ่าน BusyBox, symlink, interpreter หรือโปรแกรมอื่นอาจไม่ตรงกับเงื่อนไขที่กำหนด
+- การตรวจ suffix ของ path ไม่ได้พิสูจน์ชนิดหรือเนื้อหาจริงของไฟล์
+- PID Namespace แยก Host ออกจากกลุ่มโปรเซสได้ แต่ไม่ได้ยืนยันว่าโปรเซสนั้นเป็น Docker Container
+- Container ที่ใช้ Host PID Namespace อาจไม่เข้าเงื่อนไข `NotIn: ["host_ns"]`
+- การใช้ `SIGKILL` อาจทำให้บริการหยุดชะงัก หากเงื่อนไขกว้างเกินไป
+
+ควรใช้ร่วมกับมาตรการอื่น เช่น Least Privilege, การลด Linux Capabilities, Read-only Filesystem, Seccomp, AppArmor/SELinux, Network Policy และการเก็บ Log เพื่อตรวจสอบพฤติกรรมผิดปกติ
+
+## สรุป
+
+`matchNamespaces` ร่วมกับ `namespace: Pid` และ `operator: NotIn` เป็นวิธีจำกัดขอบเขตการทำงานของ Tetragon Policy โดยเลือกโปรเซสที่ไม่ได้อยู่ใน Host PID Namespace
+
+```yaml
+matchNamespaces:
+  - namespace: Pid
+    operator: NotIn
+    values:
+      - "host_ns"
+```
+
+จำง่าย ๆ:
+
+- `Pid` = ตรวจสอบ PID Namespace
+- `NotIn` = ไม่อยู่ใน Namespace ที่ระบุ
+- `host_ns` = ค่าอ้างอิง Host Namespace ที่ Tetragon รองรับ
+- ผลลัพธ์ = เลือกโปรเซสที่อยู่ใน PID Namespace อื่น ไม่ใช่ Host PID Namespace
+
+แนวคิดนี้ช่วยลดผลกระทบต่อโปรเซสบน Host ได้ แต่ต้องจำไว้ว่า **Namespace ไม่ใช่ตัวระบุ Docker โดยเฉพาะ** และ Policy ที่ใช้ `SIGKILL` ต้องผ่านการทดสอบอย่างรอบคอบก่อนใช้งานจริง
+
+---
+
+### 🧭 Mind Map: แนวคิดการทำงาน
+
+```text
+Tetragon TracingPolicy
+│
+├── matchNamespaces
+│   └── namespace: Pid
+│       └── operator: NotIn
+│           └── values: host_ns
+│               └── เลือก PID Namespace ที่ไม่ใช่ Host
+│
+├── security_bprm_check
+│   ├── ตรวจการเริ่ม Executable
+│   ├── ผู้เรียก: PHP / Apache / httpd
+│   ├── เป้าหมาย: Shell / Network Tools / Interpreters
+│   └── Action: SIGKILL
+│
+├── security_file_open
+│   ├── ตรวจการเปิดไฟล์
+│   ├── ผู้เรียก: sh / dash
+│   ├── เป้าหมาย: .php / .phtml / .phar
+│   └── Action: SIGKILL
+│
+└── ข้อควรระวัง
+    ├── ไม่ได้ตรวจ Docker โดยตรง
+    ├── path และ suffix อาจไม่ครอบคลุมทุกกรณี
+    ├── อาจกระทบการทำงานปกติ
+    └── ต้องทดสอบก่อน Production
+```
+
+#Tetragon #eBPF #LinuxSecurity #DockerSecurity #RockyLinux #ContainerSecurity #ThreatHunting
